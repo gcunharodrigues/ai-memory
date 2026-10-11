@@ -88,6 +88,45 @@ fn spooled_entry(data_dir: &Path) -> serde_json::Value {
 }
 
 #[test]
+fn codex_child_boundary_hooks_are_nonblocking_and_strip_assistant_fields() {
+    for event in ["subagent-start", "subagent-stop"] {
+        for capture in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let payload = serde_json::json!({
+                "session_id": "invented-parent", "agent_id": "invented-child",
+                "agent_type": "worker", "cwd": tmp.path(),
+                "last_assistant_message": "SENTINEL_CHILD_ASSISTANT"
+            })
+            .to_string();
+            let output =
+                run_hook_full_agent(tmp.path(), "codex", event, payload.as_bytes(), capture);
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"{}\n");
+            assert!(output.stderr.is_empty());
+            let entry = spooled_entry(tmp.path());
+            assert!(
+                entry["url"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("event={event}&agent=codex"))
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(entry["body"].as_str().unwrap()).unwrap();
+            assert_eq!(body["session_id"], "invented-parent");
+            assert_eq!(body["agent_id"], "invented-child");
+            assert!(body.get("last_assistant_message").is_none());
+            assert!(body.get("_ai_memory_assistant").is_none());
+            assert!(!entry.to_string().contains("SENTINEL_CHILD_ASSISTANT"));
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let output = run_hook_full_agent(tmp.path(), "codex", event, b"{malformed", false);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}\n");
+        assert!(!tmp.path().join("hook-spool").exists());
+    }
+}
+
+#[test]
 fn native_hook_accepts_plain_and_bom_prefixed_json() {
     let payload = br#"{"session_id":"windows-test","cwd":"C:\\dev\\project","tool_name":"Read","tool_input":{"file_path":"README.md"}}"#;
 

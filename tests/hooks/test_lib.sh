@@ -791,6 +791,52 @@ PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOn
     && printf 'ok' || printf 'missing')
 assert_eq "powershell session-start handoff GET carries the briefing keys" "ok" "$PS_BRIEF_STATIC"
 
+# --- codex subagent bundles ---------------------------------------------
+# The script fallback cannot sanitize an assistant message, so a Codex
+# subagent-stop carrying the raw key is dropped before any post or spool.
+# The positive controls prove the spool path is live, so the absence check
+# cannot pass vacuously; the environment is isolated for the same reason.
+CODEX_SUB_DATA="$TMP/codex-sub-data"
+codex_subagent_hook() {
+    printf '%s' "$2" \
+        | env -u AI_MEMORY_CAPTURE_OWNER -u AI_MEMORY_AUTH_TOKEN -u AI_MEMORY_RUN_ID \
+            HOME="$TMP" AI_MEMORY_DATA_DIR="$CODEX_SUB_DATA" AI_MEMORY_HOOK_URL='http://127.0.0.1:1' \
+            ${3:+AI_MEMORY_CAPTURE_OWNER="$3"} \
+            sh "$(dirname "$0")/../../hooks/codex/$1.sh" 2>/dev/null
+}
+codex_sub_spooled() { ls "$CODEX_SUB_DATA/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' '; }
+CODEX_SUB_CWD="$TMP/codex-sub"
+mkdir -p "$CODEX_SUB_CWD"
+# Payloads are built here, not inside "$(...)": bash 3.2 brace-expands a
+# quoted `{a,b}` there and drops the opening brace.
+CODEX_SUB_PLAIN="{\"session_id\":\"invented-parent\",\"agent_id\":\"invented-child\",\"agent_type\":\"worker\",\"cwd\":\"$CODEX_SUB_CWD\"}"
+CODEX_SUB_RAW="${CODEX_SUB_PLAIN%\}},\"last_assistant_message\":\"SENTINEL_CHILD_ASSISTANT\"}"
+CODEX_SUB_ROUTED="{\"session_id\":\"invented-parent\",\"cwd\":\"$TMP/routed\"}"
+
+assert_eq "codex subagent-stop with the raw assistant key prints {}" "{}" \
+    "$(codex_subagent_hook subagent-stop "$CODEX_SUB_RAW")"
+assert_eq "codex subagent-stop with the raw assistant key spools nothing" "0" "$(codex_sub_spooled)"
+assert_eq "codex subagent-stop without the key prints {}" "{}" \
+    "$(codex_subagent_hook subagent-stop "$CODEX_SUB_PLAIN")"
+assert_eq "codex subagent-stop without the key spools the event" "1" "$(codex_sub_spooled)"
+assert_eq "codex subagent-start prints nothing" "" \
+    "$(codex_subagent_hook subagent-start "$CODEX_SUB_PLAIN")"
+assert_eq "codex subagent-start spools the event" "2" "$(codex_sub_spooled)"
+assert_eq "codex subagent spool carries both events and no sentinel" "1 1 0" \
+    "$(cat "$CODEX_SUB_DATA/hook-spool/"*.json | grep -c 'event=subagent-stop&agent=codex') $(cat "$CODEX_SUB_DATA/hook-spool/"*.json | grep -c 'event=subagent-start&agent=codex') $(cat "$CODEX_SUB_DATA/hook-spool/"*.json | grep -c SENTINEL_CHILD_ASSISTANT)"
+assert_eq "codex subagent-stop prints {} when capture is owned externally" "{}" \
+    "$(codex_subagent_hook subagent-stop "$CODEX_SUB_PLAIN" invented-owner)"
+assert_eq "codex subagent-stop prints {} for a server-routed repository" "{}" \
+    "$(codex_subagent_hook subagent-stop "$CODEX_SUB_ROUTED")"
+assert_eq "owned and routed subagent-stop spool nothing" "2" "$(codex_sub_spooled)"
+rm -f "$FAKE_CURL_LOG"
+printf '%s' "$CODEX_SUB_PLAIN" \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_DATA_DIR="$TMP/codex-sub-fake" AI_MEMORY_HOOK_URL='http://memory.test' \
+        sh "$(dirname "$0")/../../hooks/codex/subagent-start.sh" >/dev/null 2>&1
+assert_eq "codex subagent-start posts the event and never fetches a handoff" "1 0" \
+    "$(grep -c '/hook?event=subagent-start&agent=codex' "$FAKE_CURL_LOG" 2>/dev/null) $(grep -c '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null)"
+
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

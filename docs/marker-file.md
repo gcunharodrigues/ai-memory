@@ -171,6 +171,12 @@ always stored regardless. This is per-project on purpose: there is no
 server-global switch, so opting one noisy project in never sheds subagent
 captures for the others on a shared instance.
 
+Codex is narrower. Its subagent hooks carry the parent's `session_id`, so for
+Codex the opt-in drops only `SubagentStart`, `SubagentStop`, and events that
+carry a subagent marker (`agent_id` / `agent_type`); it never seeds a session
+and never drops an unmarked Codex event, because that event may belong to the
+parent session.
+
 ## Allowlist mode: the marker as an opt-in
 
 By default this file is optional — a repository without one is still captured,

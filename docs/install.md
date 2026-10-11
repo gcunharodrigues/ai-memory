@@ -854,6 +854,16 @@ ai-memory finalize-session
 ai-memory finalize-session --session-id <uuid>
 ```
 
+Codex also registers `SubagentStart` and `SubagentStop`. Codex sends the
+parent session's `session_id` on both, with the child in `agent_id`, so a
+project that sets `drop_subagent_captures` drops these two events and any
+other event that carries a subagent marker, but never treats the parent
+session as a subagent: the parent's later prompts, stops, and session end are
+always kept. Codex documents no child session id, so an unmarked event from
+inside a Codex subagent cannot be recognized and dropped.
+The script fallback drops a `SubagentStop` payload that still carries
+`last_assistant_message` instead of posting it unsanitized.
+
 Antigravity CLI also lacks a true session-end event. Its `Stop` hook marks the
 end of one execution loop, so ai-memory intentionally records it without
 closing the conversation. Its `PreInvocation` hook likewise runs before every

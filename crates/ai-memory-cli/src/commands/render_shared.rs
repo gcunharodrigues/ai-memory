@@ -902,9 +902,11 @@ pub(crate) struct HookProfile {
 /// Claude Code. `SessionEnd` shipped in Codex CLI 0.145.0 (openai/codex
 /// PR #33895, "Add SessionEnd hooks for thread teardown"); it is a
 /// root-session-only event that runs synchronously during thread
-/// teardown. Codex still has no `SubagentStart`/`SubagentStop` in a
-/// first-party-supported form here, so those stay Claude-Code-only.
-pub(crate) const CODEX_EVENTS: [(&str, &str); 7] = [
+/// teardown. `SubagentStart`/`SubagentStop` carry the PARENT `session_id`
+/// (the child is `agent_id`), so the router drops them under
+/// `drop_subagent_captures` without tracking the session. They stay last so
+/// the first seven handlers render exactly as before.
+pub(crate) const CODEX_EVENTS: [(&str, &str); 9] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -912,6 +914,8 @@ pub(crate) const CODEX_EVENTS: [(&str, &str); 7] = [
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
 ];
 
 /// Command Code's stable shell-hook vocabulary. Mods expose more lifecycle
@@ -3826,6 +3830,91 @@ $payload = [Console]::In.ReadToEnd()
                 !inspect.contains("--project-strategy"),
                 "{platform:?}: no strategy flag when None: {inspect}"
             );
+        }
+    }
+
+    #[test]
+    fn codex_installer_payload_preserves_seven_events_and_adds_two_child_boundaries() {
+        for capture in [false, true] {
+            let payload = build_profile_payload_for_agent(
+                &CODEX_PROFILE,
+                Path::new("/invented/hooks/codex"),
+                "http://127.0.0.1:12345",
+                None,
+                "codex",
+                Some(Path::new("/invented/data")),
+                Some("git-remote"),
+                capture,
+            );
+            let hooks = payload["hooks"].as_object().unwrap();
+            // The seven pre-existing handlers must render byte-for-byte as
+            // before, so an upgrade does not change their trust hashes.
+            let seven = build_hook_payload(
+                &CODEX_EVENTS[..7],
+                Path::new("/invented/hooks/codex"),
+                "http://127.0.0.1:12345",
+                None,
+                CODEX_PROFILE.shape,
+                HookCommandContext::new(
+                    HookCommandPlatform::current(),
+                    "codex",
+                    Some(Path::new("/invented/data")),
+                    Some("git-remote"),
+                )
+                .with_capture_assistant(capture),
+            );
+            let seven = seven["hooks"].as_object().unwrap();
+            assert_eq!(seven.len(), 7);
+            for (event, handler) in seven {
+                assert_eq!(&hooks[event], handler, "{event}");
+            }
+            let mut names: Vec<_> = hooks.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [
+                    "PostToolUse",
+                    "PreCompact",
+                    "PreToolUse",
+                    "SessionEnd",
+                    "SessionStart",
+                    "Stop",
+                    "SubagentStart",
+                    "SubagentStop",
+                    "UserPromptSubmit"
+                ]
+            );
+            for (event, stem) in [
+                ("SessionStart", "session-start"),
+                ("UserPromptSubmit", "user-prompt-submit"),
+                ("PreToolUse", "pre-tool-use"),
+                ("PostToolUse", "post-tool-use"),
+                ("PreCompact", "pre-compact"),
+                ("Stop", "stop"),
+                ("SessionEnd", "session-end"),
+                ("SubagentStart", "subagent-start"),
+                ("SubagentStop", "subagent-stop"),
+            ] {
+                let handler = &hooks[event][0]["hooks"][0];
+                assert_eq!(handler["type"], "command");
+                let command = handler["command"].as_str().unwrap();
+                assert!(
+                    command.contains(&format!("hook --event {stem}")),
+                    "{command}"
+                );
+                assert!(command.contains("--agent codex"), "{command}");
+                assert!(
+                    command.contains("--project-strategy git-remote"),
+                    "{command}"
+                );
+                assert!(command.contains("--data-dir"), "{command}");
+                assert!(command.contains("http://127.0.0.1:12345"), "{command}");
+                assert_eq!(
+                    command.contains("--capture-assistant"),
+                    capture && event == "Stop"
+                );
+                assert!(handler.get("timeout").is_none());
+            }
         }
     }
 

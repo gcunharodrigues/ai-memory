@@ -472,10 +472,11 @@ function Invoke-AiMemoryHook {
         return
     }
     # Assistant/Stop capture (#196) is native-only. Scoped to claude-code + stop
-    # so a PostToolUse whose tool output legitimately contains the literal string
-    # is unaffected. If a Stop payload still carries the raw field, drop the whole
-    # event rather than POST it verbatim (the script fallback cannot sanitize it).
-    if ($Agent -eq "claude-code" -and $Event -eq "stop" -and $Payload -and $Payload.Contains('"last_assistant_message"')) {
+    # and codex + subagent-stop so a PostToolUse whose tool output legitimately
+    # contains the literal string is unaffected. If such a payload still carries
+    # the raw field, drop the whole event rather than POST it verbatim (the
+    # script fallback cannot sanitize it).
+    if ((($Agent -eq "claude-code" -and $Event -eq "stop") -or ($Agent -eq "codex" -and $Event -eq "subagent-stop")) -and $Payload -and $Payload.Contains('"last_assistant_message"')) {
         return
     }
     $Cwd = Resolve-AiMemoryCwd -Payload $Payload -Agent $Agent

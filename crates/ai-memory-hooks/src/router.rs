@@ -229,7 +229,8 @@ struct SubagentSessionKey {
 /// the `drop_subagent_captures` gate can also drop the **unmarked tail** of those
 /// sessions (`user_prompt_submit` / `stop` / `session_end`), which the
 /// per-event marker (`subagentType` / `agent_type`) does not cover. A session
-/// is seeded when a `SubagentStart` or any marker-bearing event arrives, and
+/// is seeded when a `SubagentStart` or any marker-bearing event arrives (never
+/// for Codex, whose subagent hooks carry the parent's session id), and
 /// forgotten on `SessionEnd` after the tail has been dropped. Bounded LRU so a
 /// missed terminal event cannot leak memory.
 #[derive(Debug)]
@@ -1184,6 +1185,10 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
 /// `stop` / `session_end`) of a session already known to be a subagent. No-op
 /// (returns `false`) unless this event's project opted in via the per-event
 /// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
+///
+/// Codex is never tracked: its subagent hooks carry the PARENT `session_id`
+/// and it documents no child session id, so seeding would drop the parent's
+/// own tail. A marked Codex event is dropped alone; an unmarked one is kept.
 async fn should_drop_subagent(
     state: &HookState,
     env: &HookEnvelope,
@@ -1191,6 +1196,13 @@ async fn should_drop_subagent(
 ) -> bool {
     if !env.drop_subagent_requested {
         return false;
+    }
+    let marked = matches!(
+        env.event,
+        HookEvent::SubagentStart | HookEvent::SubagentStop
+    ) || body_is_subagent(&env.raw);
+    if env.agent == AgentKind::Codex {
+        return marked;
     }
     let Ok(session_id) = resolve_session_id(env) else {
         return false;
@@ -1213,10 +1225,6 @@ async fn should_drop_subagent(
         project_id,
         session_id,
     };
-    let marked = matches!(
-        env.event,
-        HookEvent::SubagentStart | HookEvent::SubagentStop
-    ) || body_is_subagent(&env.raw);
 
     if marked {
         state.subagent_sessions.lock().await.insert(key);
@@ -7265,6 +7273,199 @@ mod tests {
             should_drop_subagent(&state, &unmarked_project_a, None).await,
             "the originally tracked project's unmarked tail still drops"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_child_boundaries_never_seed_the_parent_or_an_unproven_child_key() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("codex".into()),
+            project: Some("boundary-project".into()),
+            drop_subagent: Some("1".into()),
+            ..Default::default()
+        };
+        for boundary in ["subagent-start", "subagent-stop"] {
+            for child in [
+                serde_json::json!("invented-child"),
+                serde_json::json!("invented-parent"),
+                serde_json::json!(""),
+                serde_json::json!(null),
+                serde_json::json!(17),
+                serde_json::json!({}),
+            ] {
+                let env = HookEnvelope::from_query_and_body(
+                    query(boundary),
+                    serde_json::json!({
+                        "session_id": "invented-parent", "agent_id": child, "agent_type": "worker"
+                    }),
+                );
+                assert_eq!(env.session_id.as_deref(), Some("invented-parent"));
+                assert!(should_drop_subagent(&state, &env, None).await);
+                assert!(
+                    should_drop_subagent(&state, &env, None).await,
+                    "duplicate boundary"
+                );
+                for session in ["invented-parent", "invented-child"] {
+                    for tail in ["user-prompt-submit", "stop", "session-end"] {
+                        let env = HookEnvelope::from_query_and_body(
+                            query(tail),
+                            serde_json::json!({"session_id": session}),
+                        );
+                        assert!(
+                            !should_drop_subagent(&state, &env, None).await,
+                            "{boundary} must not taint {session} {tail} with child {child}"
+                        );
+                    }
+                }
+            }
+            let missing = HookEnvelope::from_query_and_body(
+                query(boundary),
+                serde_json::json!({"session_id": "invented-parent"}),
+            );
+            assert!(should_drop_subagent(&state, &missing, None).await);
+            let root = HookEnvelope::from_query_and_body(
+                query("stop"),
+                serde_json::json!({"session_id": "invented-parent"}),
+            );
+            assert!(!should_drop_subagent(&state, &root, None).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_parent_capture_survives_duplicate_child_boundaries_in_batch() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let mut items = Vec::new();
+        for event in [
+            "subagent-start",
+            "subagent-start",
+            "subagent-stop",
+            "subagent-stop",
+            "user-prompt-submit",
+            "stop",
+            "session-end",
+        ] {
+            items.push(HookBatchItem {
+                url: format!("http://h/hook?event={event}&agent=codex&drop_subagent=1"),
+                body: if event.starts_with("subagent-") {
+                    serde_json::json!({"session_id": "codex-batch-parent", "agent_id": "codex-batch-child", "agent_type": "worker"})
+                } else {
+                    serde_json::json!({"session_id": "codex-batch-parent", "prompt": "invented parent prompt"})
+                },
+            });
+        }
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 7);
+        let observations = state
+            .reader
+            .observations_for_session(SessionId::from_native("codex-batch-parent"))
+            .await
+            .unwrap();
+        assert!(
+            observations
+                .iter()
+                .any(|o| o.kind == ObservationKind::UserPrompt),
+            "parent prompt must be stored after child boundaries"
+        );
+        assert_eq!(state.ingest_metrics.snapshot().dropped_by_policy, 4);
+    }
+
+    #[tokio::test]
+    async fn codex_marked_event_seeds_no_tail_in_any_workspace_project_or_actor() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let item = |agent: &str, workspace: &str, project: &str, event: &str, marked: bool| {
+            let mut raw = serde_json::json!({"session_id": "reused-child"});
+            if marked {
+                raw["agent_id"] = serde_json::json!("invented-child-marker");
+            }
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event={event}&agent={agent}&workspace={workspace}&project={project}&drop_subagent=1"
+                ),
+                body: raw,
+            }
+        };
+        let actor = |name: Option<&str>| {
+            name.map(|name| {
+                axum::Extension(ai_memory_core::ActorContext {
+                    user: Some(name.into()),
+                    ..Default::default()
+                })
+            })
+        };
+        let send = |item: HookBatchItem, name: Option<&str>| {
+            let state = state.clone();
+            let actor = actor(name);
+            async move {
+                let before = state.ingest_metrics.snapshot().dropped_by_policy;
+                let response = handle_hook_batch(
+                    State(state.clone()),
+                    actor,
+                    None,
+                    None,
+                    HeaderMap::new(),
+                    Json(vec![item]),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                state.ingest_metrics.snapshot().dropped_by_policy - before
+            }
+        };
+
+        // A marked Codex event is itself dropped under the opt-in ...
+        let marked = item("codex", "workspace-a", "project-a", "pre-tool-use", true);
+        assert_eq!(send(marked, Some("alice")).await, 1);
+        // ... but seeds nothing: Codex child hooks carry the parent session
+        // id, so every later unmarked event survives in every scope.
+        for (workspace, project, name) in [
+            ("workspace-a", "project-a", Some("alice")),
+            ("workspace-a", "project-b", Some("alice")),
+            ("workspace-b", "project-a", Some("alice")),
+            ("workspace-a", "project-a", Some("bob")),
+            ("workspace-a", "project-a", None),
+        ] {
+            for tail in ["user-prompt-submit", "stop", "session-end"] {
+                let unmarked = item("codex", workspace, project, tail, false);
+                assert_eq!(
+                    send(unmarked, name).await,
+                    0,
+                    "unmarked Codex {tail} must survive: {workspace}/{project}/{name:?}"
+                );
+            }
+        }
+
+        // Preservation control: Claude Code still seeds on `subagent-start`
+        // and drops the unmarked tail of that same scoped session.
+        let start = item(
+            "claude-code",
+            "workspace-a",
+            "project-a",
+            "subagent-start",
+            false,
+        );
+        assert_eq!(send(start, Some("alice")).await, 1);
+        let foreign = item("claude-code", "workspace-a", "project-b", "stop", false);
+        assert_eq!(send(foreign, Some("alice")).await, 0);
+        let tail = item("claude-code", "workspace-a", "project-a", "stop", false);
+        assert_eq!(send(tail, Some("alice")).await, 1);
     }
 
     #[tokio::test]

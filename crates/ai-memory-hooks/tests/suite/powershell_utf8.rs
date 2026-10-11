@@ -135,3 +135,81 @@ fn powershell_hook_posts_json_as_utf8_bytes() {
         "中文记忆测试：行动完成 — Validação: não, memória, correção, ação"
     );
 }
+
+/// Runs a real Codex PowerShell peer with `payload` on stdin.
+fn run_codex_script(script: &str, server: &str, payload: &str) -> std::process::Output {
+    let script = repo_root().join("hooks").join("codex").join(script);
+    let mut child = Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .env("AI_MEMORY_HOOK_URL", server)
+        .env_remove("AI_MEMORY_CAPTURE_OWNER")
+        .env_remove("AI_MEMORY_AUTH_TOKEN")
+        .env_remove("AI_MEMORY_RUN_ID")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run Codex PowerShell hook");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(payload.as_bytes())
+        .expect("write hook payload");
+    child
+        .wait_with_output()
+        .expect("wait for Codex PowerShell hook")
+}
+
+#[test]
+fn codex_subagent_stop_never_posts_a_raw_assistant_message() {
+    let invented = serde_json::json!({
+        "session_id": "invented-parent",
+        "agent_id": "invented-child",
+        "agent_type": "worker",
+    });
+
+    // The raw assistant field must never leave the machine: no connection.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let mut raw = invented.clone();
+    raw["last_assistant_message"] = serde_json::json!("SENTINEL_CHILD_ASSISTANT");
+    let output = run_codex_script("subagent-stop.ps1", &server, &raw.to_string());
+    assert!(
+        output.status.success(),
+        "PowerShell hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"{}");
+    // The POST is synchronous, so a connection would be queued by now.
+    listener.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "a subagent-stop carrying last_assistant_message must not be posted"
+    );
+
+    // Control: the same script posts a payload without the field.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let receiver = thread::spawn(move || receive_one_request(listener));
+    let output = run_codex_script("subagent-stop.ps1", &server, &invented.to_string());
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}");
+    let (headers, body) = receiver.join().unwrap();
+    assert!(
+        headers.contains("event=subagent-stop&agent=codex"),
+        "{headers}"
+    );
+    assert_eq!(body, invented.to_string().as_bytes());
+}

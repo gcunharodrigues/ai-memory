@@ -53,8 +53,9 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message"];
 ///
 /// Codex's `Stop` hook payload carries `last_assistant_message` (verified on
 /// codex-cli 0.154.0, #743) — the same spelling Claude Code uses, so no new
-/// entry in [`ASSISTANT_MESSAGE_FIELDS`] is needed. Codex has no `SubagentStop`
-/// in its supported event vocabulary, so only `(Codex, Stop)` is added.
+/// entry in [`ASSISTANT_MESSAGE_FIELDS`] is needed. Codex's `SubagentStop`
+/// carries the subagent's `last_assistant_message` too, but only `(Codex, Stop)`
+/// is a capture candidate, so that field is always stripped.
 #[must_use]
 pub fn assistant_message_field(agent: AgentKind, event: HookEvent) -> Option<&'static str> {
     match (agent, event) {

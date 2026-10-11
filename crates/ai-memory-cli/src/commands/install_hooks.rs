@@ -7094,8 +7094,8 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(codex.contains("stop"));
         assert!(codex.contains("session-end"));
         assert!(
-            !codex.contains("subagent-start") && !codex.contains("subagent-stop"),
-            "Codex manual output must omit scripts outside Codex's hook vocabulary: {codex}"
+            codex.contains("subagent-start") && codex.contains("subagent-stop"),
+            "Codex manual output must list its subagent scripts: {codex}"
         );
     }
 
