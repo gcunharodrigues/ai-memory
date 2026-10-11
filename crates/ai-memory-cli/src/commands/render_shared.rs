@@ -3903,8 +3903,10 @@ $payload = [Console]::In.ReadToEnd()
                     "{command}"
                 );
                 assert!(command.contains("--agent codex"), "{command}");
+                // Windows native commands double-quote the value.
                 assert!(
-                    command.contains("--project-strategy git-remote"),
+                    command.contains("--project-strategy git-remote")
+                        || command.contains(r#"--project-strategy "git-remote""#),
                     "{command}"
                 );
                 assert!(command.contains("--data-dir"), "{command}");
