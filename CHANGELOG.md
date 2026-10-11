@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marker-bearing event is dropped without marking the session as a subagent,
   and the parent's later prompts, stops, and session end are kept. The script
   fallbacks drop a Codex `SubagentStop` that still carries
-  `last_assistant_message` instead of sending it unsanitized (local task
-  ai-memory-a; no public issue).
+  `last_assistant_message` instead of sending it unsanitized (no public issue
+  yet).
 
 ## [2.5.2] - 2026-10-01
 
