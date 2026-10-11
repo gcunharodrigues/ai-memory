@@ -171,10 +171,14 @@ fn run_codex_script(script: &str, server: &str, payload: &str) -> std::process::
 
 #[test]
 fn codex_subagent_stop_never_posts_a_raw_assistant_message() {
+    // An explicit marker-free cwd keeps the marker walk off the runner's
+    // working directory.
+    let cwd = tempfile::tempdir().unwrap();
     let invented = serde_json::json!({
         "session_id": "invented-parent",
         "agent_id": "invented-child",
         "agent_type": "worker",
+        "cwd": cwd.path(),
     });
 
     // The raw assistant field must never leave the machine: no connection.
