@@ -7387,6 +7387,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_subagent_events_are_kept_without_the_drop_subagent_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let items = [
+            ("subagent-start", None),
+            ("subagent-stop", None),
+            ("pre-tool-use", Some("Read")),
+        ]
+        .into_iter()
+        .map(|(event, tool)| {
+            let mut body = serde_json::json!({
+                "session_id": "codex-optout-parent", "agent_id": "codex-optout-child",
+                "agent_type": "worker"
+            });
+            if let Some(tool) = tool {
+                body["tool_name"] = serde_json::json!(tool);
+            }
+            HookBatchItem {
+                url: format!("http://h/hook?event={event}&agent=codex"),
+                body,
+            }
+        })
+        .collect();
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.ingest_metrics.snapshot().dropped_by_policy,
+            0,
+            "without the opt-in no Codex subagent event may be dropped"
+        );
+        let observations = state
+            .reader
+            .observations_for_session(SessionId::from_native("codex-optout-parent"))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 3, "{observations:?}");
+    }
+
+    #[tokio::test]
     async fn codex_marked_event_seeds_no_tail_in_any_workspace_project_or_actor() {
         let tmp = TempDir::new().unwrap();
         let state = Arc::new(make_state(&tmp).await);
